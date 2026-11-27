@@ -25,22 +25,28 @@
 #define PAL_N 6
 #define MAXP 300
 #define START_LEN 300.0f
+#ifndef WIN_SCORE
+#define WIN_SCORE 999 // reaching this score ends the game: the road ends in a dead end and you win
+#endif
 
 static const Color PAL[PAL_N] = {
     {0, 255, 255, 255}, {255, 40, 200, 255}, {120, 255, 40, 255},
     {255, 150, 0, 255}, {150, 90, 255, 255}, {255, 240, 40, 255}};
 
 // A fork has a real branch N (direction `side`, -1 left / 0 middle / +1 right) and one or two dead ends (D, E).
-typedef struct { Vector2 P, F, N, D1, D2, E1, E2; int side, dirD, three; float S; } Level;
+// `end`: the last stretch of the road, a dead end with no branches (the player wins on reaching it).
+// `merge`: the two branches split and join again at N, both lead on, but the middle of each blinks open/closed
+// (the left branch is D1/D2, the right one E1/E2); an orb travels between the two gaps and fills the one it is in.
+typedef struct { Vector2 P, F, N, D1, D2, E1, E2; int side, dirD, three, merge, end; float S, gapPhase, orbF, orbVel, orbHue; } Level;
 typedef struct { Vector2 pos, vel; float life, max; Color col; float size; } Particle;
-typedef enum { ST_INTRO, ST_ZOOM, ST_PLAY, ST_DEAD } State;
+typedef enum { ST_INTRO, ST_ZOOM, ST_PLAY, ST_DEAD, ST_WON } State;
 // Which segment of a fork the player is on. The values double as segment types in the per-segment arrays:
-// 0 approach, 1 real branch, 2/3 first dead branch + tip, 4/5 second dead branch + tip (3-way forks).
-typedef enum { K_APPROACH, K_TRUE, K_D1, K_D2, K_E1, K_E2 } Kind;
+// (see SegState; in a merge fork the kinds 1..6 walk along the left (1-3) or right (4-6) branch)
+typedef enum { K_APPROACH, K_TRUE, K_D1, K_D2, K_E1, K_E2, K_X6 } Kind;
 
 static Level L[MAXL];
-// Per-segment state. A fork has up to 6 segments (type t): 0 approach, 1 real branch, 2/3 dead branch + tip,
-// 4/5 second dead branch + tip (3-way forks).
+// Per-segment state. A fork has up to 7 segments (type t). Normal fork: 0 approach, 1 real branch, 2/3 dead branch + tip,
+// 4/5 second dead branch + tip (3-way forks). Merge fork: 0 approach, 1-3 left branch (out, middle, back in), 4-6 right branch.
 typedef struct {
     float fill;                 // yellow fill fraction, 0..1, from the segment's start
     float burn;                 // 0 = intact ... 1 = gone, measured from the segment's start (its root)
@@ -49,18 +55,20 @@ typedef struct {
     unsigned char burning;      // is it burning away?
     unsigned char alt;          // was it an alternative that was not taken (drawn red)?
 } SegState;
-static SegState S[MAXL][6];
+#define NSEG 7
+static SegState S[MAXL][NSEG];
 static int gen;
 static Particle parts[MAXP];
 // Burn state ("fuse"): once a path can no longer be selected it burns away from its root.
 static int introSel, deathBurn;
 #define BURN_SPEED 1000.0f
 static const Color FYEL = {255, 240, 40, 255}; // the fuse yellow (the red and yellow fills themselves live in the path shader)
+static const Color FREDC = {255, 30, 50, 255}; // the red of the branches that are not selected (orbs follow the same colours)
 static State st;
 static Kind kind;
 static Vector2 pos, to;
 static int lv, choice, best[2], hard, startSide = 1, lastSide = 1;
-static float runT, speed, zoomT, deadT, flash, shake, tnow;
+static float runT, speed, zoomT, deadT, winT, flash, shake, tnow;
 // Three typefaces: Tilt Neon for the UI text, Neoneon for the title, Beon for the score numbers.
 // bold: sub-pixel thickening of thin strokes, as a fraction of the font size (0 = none).
 typedef struct { Font f; float bold; } Face;
@@ -74,6 +82,10 @@ static Camera2D cam;
 #endif
 
 static int kbHint = 1; // show keyboard hints? (a physical keyboard is present / was used)
+// Zoom-out to prepare for the first merge forks: the zoom factor eases out just before the first one appears,
+// and eases back to normal as merge forks are passed (or, failing that, as forks go by).
+static int firstMerge = -1, mergesPassed;
+static float mergeZoom = 1;
 static float scorePop;  // score "pop" animation, 1 -> 0
 static float uiS = 1; // UI scale (text, arrows) for the current screen size
 static Shader fogShader;
@@ -100,11 +112,12 @@ typedef struct {
     float extra0, extraStep, extraCap, extraRand;      // extra length of a dead end's tip
     float zStart, zMax, zSecs;                         // gameplay zoom: starts zoomed out, eases in over zSecs
     float fogMax, fogStep, fogMin;                     // fog radius (px at 900 px height): clamp(fogMax - fogStep * fork)
+    int merge0; float mergeP0, mergeStep, mergeMax;    // merge forks (with the orb): from fork merge0, chance mergeP0 + mergeStep * (fork - merge0), capped at mergeMax
     float startPitch;                                  // pitch of the start whoosh
 } Diff;
 static const Diff DIFF[2] = {
-    {"EASY", 0, 300, 10, 520, 240, 3, 8, 0.2f, 0.03f, 0.5f, 0.4f, 0.6f, 40, 4, 60, 30, 0.45f, 0.8f, 90, 1500, 20, 900, 0.9f},
-    {"HARD", 1, 380, 20, 780, 170, 8, 4, 0.3f, 0.04f, 0.7f, 0.6f, 0.85f, 60, 10, 160, 50, 0.5f, 0.95f, 60, 1100, 40, 520, 1.2f},
+    {"EASY", 0, 300, 10, 520, 240, 3, 8, 0.2f, 0.03f, 0.5f, 0.4f, 0.6f, 40, 4, 60, 30, 0.45f, 0.8f, 90, 1500, 20, 900, 50, 0.06f, 0.012f, 0.4f, 0.9f},
+    {"HARD", 1, 380, 20, 780, 170, 8, 4, 0.3f, 0.04f, 0.7f, 0.6f, 0.85f, 60, 10, 160, 50, 0.5f, 0.95f, 60, 1100, 40, 520, 50, 0.05f, 0.01f, 0.35f, 1.2f},
 };
 static float baseSpeed(int l) { const Diff *d = &DIFF[hard]; return fminf(d->spd0 + d->spdStep * l, d->spdMax); }
 
@@ -115,7 +128,7 @@ static float baseSpeed(int l) { const Diff *d = &DIFF[hard]; return fminf(d->spd
 #define SR 44100
 #define CHUNK 2048
 typedef struct { Sound v[3]; } Sfx; // pre-panned variants: [0] left, [1] centre, [2] right
-static Sfx sStart, sPick, sWrong, sCrash;
+static Sfx sStart, sPick, sWrong, sCrash, sWin;
 static AudioStream bed;
 static int audioOK, muted, bedOn;
 static int inBackground; // window not focused / hidden: the frame rate drops, so the sound is muted instead of stuttering
@@ -251,6 +264,28 @@ static float droneTab[DT_N + 1]; // one 4*PI period of sin(p) + 0.5 sin(1.5p) + 
 
 // The effects are synthesized one per frame right after startup (not all before the first frame), so the window
 // appears immediately; an effect that is not built yet is simply skipped.
+static Sfx gen_win(void) { // calm victory: a slow rising major arpeggio of soft bells that rings out
+    int n = (int)(5.0f * SR);
+    float *l, *r;
+    alloc_lr(n, &l, &r);
+    static const float fq[5] = {261.63f, 329.63f, 392.0f, 523.25f, 659.25f}; // C4 E4 G4 C5 E5
+    static const float t0[5] = {0.0f, 0.4f, 0.8f, 1.25f, 1.75f}, pan[5] = {-0.4f, 0.3f, -0.2f, 0.45f, 0.0f};
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / SR;
+        for (int k = 0; k < 5; k++) {
+            float tt = t - t0[k];
+            if (tt < 0) continue;
+            float env = (1 - expf(-tt * 14)) * expf(-tt * 0.85f); // soft attack, long calm decay
+            float v = sinf(2 * PI * fq[k] * tt) + 0.25f * sinf(4 * PI * fq[k] * tt) * expf(-tt * 1.5f) + 0.08f * sinf(6 * PI * fq[k] * tt) * expf(-tt * 2.5f);
+            float gl, gr;
+            pan_gains(pan[k], &gl, &gr);
+            l[i] += v * env * gl * 0.35f; r[i] += v * env * gr * 0.35f;
+        }
+    }
+    reverb(l, r, n, 0.55f);
+    return make_sfx(l, r, n, 0.5f, 0);
+}
+
 static void audio_warm(void) {
     static int next;
     if (!audioOK) return;
@@ -259,6 +294,7 @@ static void audio_warm(void) {
     case 1: sWrong = gen_wrong(); break;
     case 2: sStart = gen_start(); break;
     case 3: sCrash = gen_crash(); break;
+    case 4: sWin = gen_win(); break;
     default: return;
     }
     next++;
@@ -355,23 +391,130 @@ static void make_dead(Level *l, int dir, float a, float T, float maxDepth, int i
 // the levels around the player that are simulated and drawn
 static int win_hi(void) { return lv + 8 < gen ? lv + 8 : gen - 1; }
 static int win_lo(int back) { return lv > back ? lv - back : 0; }
+// does segment (j, t) exist? (type 6 and the middle types differ between fork shapes)
+static int seg_exists(int j, int t) { return L[j].end ? t == 0 : L[j].merge ? 1 : (t < 4 || (t < 6 && L[j].three)); }
 static void seg_geo(int j, int t, Vector2 *a, Vector2 *b);
+
+static int put_seg(float *arr, int *n, int cap, Vector2 a, Vector2 b);
+
+// ---- the orb and the gaps. The middle segment of each branch of a merge fork (types 2 and 5) has a gap, and an orb
+// travels between the two gaps: the gap the orb sits in is closed (filled), the other is open. The orb dwells in a
+// gap for a while, then glides across to the other one, so the open/closed toggling is exactly the orb's movement.
+// While the player crosses a gap the orb waits in it.
+#define GAP_PERIOD 3.0f   // one full round trip of the orb
+#define ORB_DWELL 0.4f   // fraction of the cycle spent in each gap; the rest is travelling (2 * (dwell + travel) = 1)
+#define ORB_TRAVEL 0.1f
+#define GAP_A 0.2f // the gap spans this part of the middle segment, as fractions of its length
+#define GAP_B 0.8f
+static int has_gap(int j, int t) { return L[j].merge && (t == 2 || t == 5); }
+static void gap_tip(int j, int t, Vector2 *A, Vector2 *u, float *len) { // start, unit direction and length of the middle segment
+    Vector2 B = t == 2 ? L[j].D2 : L[j].E2;
+    *A = t == 2 ? L[j].D1 : L[j].E1;
+    Vector2 d = Vector2Subtract(B, *A);
+    *len = fmaxf(Vector2Length(d), 1.0f);
+    *u = Vector2Scale(d, 1.0f / *len);
+}
+// is the point inside the segment's gap area (open or not)?
+static int in_gap_area(int j, int t, Vector2 p) {
+    Vector2 A, u; float len;
+    gap_tip(j, t, &A, &u, &len);
+    float tp = Vector2DotProduct(Vector2Subtract(p, A), u);
+    return tp >= GAP_A * len && tp <= GAP_B * len;
+}
+static float ease3(float x) { return x * x * (3 - 2 * x); }
+// where the orb is at time tm: 0 = in the left branch's gap, 1 = in the right branch's gap, smooth in between
+static float orb_cycle_pos(int j, float tm) {
+    float u = fmodf(tm / GAP_PERIOD + L[j].gapPhase, 1.0f);
+    if (u < ORB_DWELL) return 0;
+    if (u < ORB_DWELL + ORB_TRAVEL) return ease3((u - ORB_DWELL) / ORB_TRAVEL);
+    if (u < 2 * ORB_DWELL + ORB_TRAVEL) return 1;
+    return 1 - ease3((u - 2 * ORB_DWELL - ORB_TRAVEL) / ORB_TRAVEL);
+}
+// the gap the player is crossing right now (2 or 5), or 0
+static int crossing_gap(int j) {
+    int t = (int)kind;
+    return (st == ST_PLAY || st == ST_ZOOM) && j == lv && has_gap(j, t) && in_gap_area(j, t, pos) ? t : 0;
+}
+// is branch `side` (0 left, 1 right) of merge fork j the lit (yellow) one? After the player commits it is the branch taken.
+static int branch_lit(int j, int side) {
+    int committed = S[j][1].alt || S[j][4].alt; // the branch not taken is marked as an alternative
+    if (committed) return side == 0 ? !S[j][1].alt : !S[j][4].alt;
+    return S[j][side == 0 ? 2 : 5].target;
+}
+static Color mix_color(Color a, Color b, float f) {
+    return (Color){(unsigned char)Lerp(a.r, b.r, f), (unsigned char)Lerp(a.g, b.g, f), (unsigned char)Lerp(a.b, b.b, f), 255};
+}
+
+// the orb moves towards where it should be; it waits in the gap the player is crossing
+static void update_orbs(float dt) {
+    for (int j = win_lo(2); j <= win_hi(); j++) {
+        if (!L[j].merge) continue;
+        int c = crossing_gap(j);
+        float target = c == 2 ? 0.0f : (c == 5 ? 1.0f : orb_cycle_pos(j, tnow));
+        float before = L[j].orbF, step = 12.0f * dt; // fast enough to rush to the player's gap
+        L[j].orbF = before + Clamp(target - before, -step, step);
+        L[j].orbVel = dt > 0 ? (L[j].orbF - before) / dt : 0;
+        // colour: red or yellow, gradually, according to the branch it is heading to (or sits in, when it is not moving)
+        int dest = fabsf(L[j].orbVel) > 0.3f ? L[j].orbVel > 0 : L[j].orbF > 0.5f;
+        float hue = branch_lit(j, dest) ? 1.0f : 0.0f, hstep = 9.0f * dt;
+        L[j].orbHue += Clamp(hue - L[j].orbHue, -hstep, hstep);
+    }
+}
+// A gap is drawn closed only while the orb really sits in it. (So the orb is visible exactly while a gap is open.)
+static int gap_open(int j, int t) { return t == 2 ? L[j].orbF > 0.12f : L[j].orbF < 0.88f; }
+// Stepping onto a gap only kills if the orb is far from it: when the orb is within reach (it is on its way there or
+// has just left) it rushes in and fills the gap for the player. Leaving one gap and arriving at the other overlap in
+// the middle of the trip, so at any moment the player can safely cross at least one of the two.
+#define ORB_REACH 0.67f
+static int gap_deadly(int j, int t) { return t == 2 ? L[j].orbF > ORB_REACH : L[j].orbF < 1.0f - ORB_REACH; }
+// put_seg for segment (j, t); where the gap is open the middle is left out (up to two pieces are emitted)
+static int put_seg_j(float *arr, int *n, int cap, int j, int t, Vector2 a, Vector2 b) {
+    if (!has_gap(j, t) || !gap_open(j, t)) return put_seg(arr, n, cap, a, b);
+    Vector2 A, u; float len;
+    gap_tip(j, t, &A, &u, &len);
+    float ta = Vector2DotProduct(Vector2Subtract(a, A), u), tb = Vector2DotProduct(Vector2Subtract(b, A), u);
+    float g0 = GAP_A * len, g1 = GAP_B * len, e1 = fminf(tb, g0), s2 = fmaxf(ta, g1);
+    int k = 0;
+    if (ta < e1) k += put_seg(arr, n, cap, Vector2Add(A, Vector2Scale(u, ta)), Vector2Add(A, Vector2Scale(u, e1)));
+    if (s2 < tb) k += put_seg(arr, n, cap, Vector2Add(A, Vector2Scale(u, s2)), Vector2Add(A, Vector2Scale(u, tb)));
+    return k;
+}
 
 static void build_level(int i) {
     Level *l = &L[i];
     if (i == 0) { l->P = (Vector2){0, 0}; l->F = (Vector2){0, -START_LEN}; }
     else { l->P = L[i - 1].N; l->F = (Vector2){l->P.x, l->P.y - L[i - 1].S}; }
+    l->end = 0;
+    if (i == WIN_SCORE) { // the end of the road: no more forks, just a long dead end
+        l->F = (Vector2){l->P.x, l->P.y - 700};
+        l->N = l->D1 = l->D2 = l->E1 = l->E2 = l->F;
+        l->side = 1; l->dirD = -1; l->three = l->merge = 0; l->S = 0; l->gapPhase = l->orbF = l->orbVel = l->orbHue = 0;
+        l->end = 1;
+        return;
+    }
     float T = frand(340, 420);
     const Diff *df = &DIFF[hard];
     l->S = fmaxf(df->gapMin, 320.0f - i * df->gapStep) + frand(0, 40);
     l->E1 = l->E2 = l->F;
-    l->three = 0;
+    l->three = 0; l->merge = 0; l->gapPhase = 0; l->orbF = 0; l->orbVel = 0; l->orbHue = 0;
     if (i == 0) {
         // the intro fork: two identical-looking branches, the chosen one is the real path
         float a = 40 * DEG2RAD;
         l->side = startSide; l->dirD = -startSide; T = 360;
         l->N = (Vector2){l->F.x + l->side * sinf(a) * T, l->F.y - cosf(a) * T};
         l->D1 = l->D2 = (Vector2){l->F.x - l->side * sinf(a) * T, l->F.y - cosf(a) * T};
+        return;
+    }
+    // some forks split and merge again: both branches lead on, but the middle of each blinks open/closed
+    if (i >= df->merge0 && frand(0, 1) < fminf(df->mergeP0 + df->mergeStep * (i - df->merge0), df->mergeMax)) {
+        l->merge = 1; l->side = 1; l->dirD = -1;
+        l->gapPhase = frand(0, 1);
+        float ang = frand(35, 45) * DEG2RAD, diag = frand(190, 230), mid = frand(300, 360);
+        float dx = sinf(ang) * diag, dy = cosf(ang) * diag;
+        l->D1 = (Vector2){l->F.x - dx, l->F.y - dy}; l->D2 = (Vector2){l->D1.x, l->D1.y - mid};
+        l->E1 = (Vector2){l->F.x + dx, l->F.y - dy}; l->E2 = (Vector2){l->E1.x, l->E1.y - mid};
+        l->N = (Vector2){l->F.x, l->F.y - 2 * dy - mid};
+        l->S = 0.7f * fmaxf(df->gapMin, 320.0f - i * df->gapStep) + frand(0, 30); // the fork itself is long
         return;
     }
     // later on, forks get a third (middle) branch: more alternatives, more difficulty
@@ -407,13 +550,13 @@ static void build_level(int i) {
 }
 static void gen_level(int i) {
     build_level(i);
-    for (int t = 0; t < 6; t++) {
+    for (int t = 0; t < NSEG; t++) {
         Vector2 a, b;
         seg_geo(i, t, &a, &b);
         S[i][t].len = fmaxf(Vector2Distance(a, b), 1.0f);
     }
 }
-static void ensure_gen(int n) { while (gen <= n && gen < MAXL) gen_level(gen++); }
+static void ensure_gen(int n) { while (gen <= n && gen <= WIN_SCORE && gen < MAXL) gen_level(gen++); }
 
 // ---------------------------------------------------------------- drawing
 // The whole path (neon tubes, red/yellow fills, glow) is rendered in ONE fragment shader from signed
@@ -425,13 +568,13 @@ static float uP[MAXPS * 4], uPc[MAXPS * 3], uR[MAXRS * 4], uY[MAXYS * 4];
 static int nuP, nuR, nuY;
 static Rectangle viewR; // visible world rectangle (+ margin), used to skip off-screen segments
 static Shader pathShader;
-static int locCamT, locCamOff, locZoom, locScrH, locPulse, locTime, locPw, locNP, locNR, locNY, locP, locPc, locR, locY;
+static int locCamT, locCamOff, locZoom, locScrH, locPulse, locTime, locPw, locFade, locNP, locNR, locNY, locP, locPc, locR, locY;
 
 #define STR_(x) #x
 #define STR(x) STR_(x)
 static const char *pathFs =
     GLSL_HEAD
-    "uniform vec2 camT, camOff;\nuniform float zoom, scrH, pulse, pw, time;\n"
+    "uniform vec2 camT, camOff;\nuniform float zoom, scrH, pulse, pw, time, pathFade;\n"
     "uniform int nP, nR, nY;\n"
     "uniform vec4 pSeg[" STR(MAXPS) "];\nuniform vec3 pCol[" STR(MAXPS) "];\n"
     "uniform vec4 rSeg[" STR(MAXRS) "];\nuniform vec4 ySeg[" STR(MAXYS) "];\n"
@@ -476,14 +619,14 @@ static const char *pathFs =
     "            acc += pCol[i] * w; wsum += w;\n"
     "        }\n"
     "        vec3 tc = acc / wsum;\n"
-    "        covOut = 1.0 - smoothstep(-aa, aa, sd);\n"
+    "        covOut = (1.0 - smoothstep(-aa, aa, sd)) * pathFade;\n"
     "        float covIn = 1.0 - smoothstep(-aa, aa, sd + 5.0);\n"
     "        float ring = covOut - covIn;\n"
     "        float s = max(sp, 0.0);\n"
     "        float glow = 0.5 * exp(-s / 4.0) + 0.22 * exp(-s / 14.0) + 0.1 * exp(-s / 42.0);\n"
     "        float inner = sp < 0.0 ? 0.28 * exp(sp / 12.0) : 0.0;\n"
     "        float lum = ring + (1.0 - covOut) * glow * pulse + covIn * inner;\n"
-    "        col = mix(tc, vec3(1.0), 0.3 * ring) * lum;\n"
+    "        col = mix(tc, vec3(1.0), 0.3 * ring) * lum * pathFade;\n"
     "        }\n"
     "    }\n"
     "    float fr = 1e9, fyv = 1e9;\n"
@@ -520,15 +663,16 @@ static void draw_path(void) {
     if (st == ST_INTRO) { lo = 0; hi = 0; }
     nuP = 0;
     for (int j = lo; j <= hi; j++)
-        for (int t = 0; t < 6; t++) {
-            if (t >= 4 && !L[j].three) continue;
+        for (int t = 0; t < NSEG; t++) {
+            if (!seg_exists(j, t)) continue;
             if (S[j][t].burn >= 1) continue;
             Vector2 a, b;
             seg_geo(j, t, &a, &b);
             a = Vector2Lerp(a, b, S[j][t].burn); // burnt away from the root
             Color c = t == 0 ? PAL[j % PAL_N] : PAL[(j + 1) % PAL_N];
-            if (put_seg(uP, &nuP, MAXPS, a, b)) {
-                float *pc = uPc + (nuP - 1) * 3;
+            int k = put_seg_j(uP, &nuP, MAXPS, j, t, a, b); // k pieces (more than one when a gap splits it)
+            for (int q = 1; q <= k; q++) {
+                float *pc = uPc + (nuP - q) * 3;
                 pc[0] = c.r / 255.0f; pc[1] = c.g / 255.0f; pc[2] = c.b / 255.0f;
             }
         }
@@ -543,13 +687,26 @@ static void draw_path(void) {
 
 static void seg_geo(int j, int t, Vector2 *a, Vector2 *b) {
     Level *m = &L[j];
+    if (m->merge) { // F -> out -> middle -> back in to N, on each side
+        switch (t) {
+        case 0: *a = m->P; *b = m->F; break;
+        case 1: *a = m->F; *b = m->D1; break;
+        case 2: *a = m->D1; *b = m->D2; break;
+        case 3: *a = m->D2; *b = m->N; break;
+        case 4: *a = m->F; *b = m->E1; break;
+        case 5: *a = m->E1; *b = m->E2; break;
+        default: *a = m->E2; *b = m->N; break;
+        }
+        return;
+    }
     switch (t) {
     case 0: *a = m->P; *b = m->F; break;
     case 1: *a = m->F; *b = m->N; break;
     case 2: *a = m->F; *b = m->D1; break;
     case 3: *a = m->D1; *b = m->D2; break;
     case 4: *a = m->F; *b = m->E1; break;
-    default: *a = m->E1; *b = m->E2; break;
+    case 5: *a = m->E1; *b = m->E2; break;
+    default: *a = *b = m->F; break; // (type 6 only exists in merge forks)
     }
 }
 // the player's current segment type is simply `kind` (see Kind: values double as segment types)
@@ -560,7 +717,7 @@ static int eff_sel(int j) { return j == 0 ? L[0].side : (L[j].three ? choice : (
 
 static void compute_targets(void) {
     int lo = win_lo(1), hi = win_hi();
-    for (int j = lo; j <= hi; j++) for (int t = 0; t < 6; t++) S[j][t].target = 0;
+    for (int j = lo; j <= hi; j++) for (int t = 0; t < NSEG; t++) S[j][t].target = 0;
     if (st == ST_INTRO) {
         if (introSel) {
             int selN = (introSel > 0) == (L[0].side > 0);
@@ -568,17 +725,27 @@ static void compute_targets(void) {
         }
         return;
     }
-    if (st == ST_DEAD) return;
+    if (st == ST_DEAD || st == ST_WON) return;
     int ty = (int)kind, j = lv;
-    if (ty == 2) { S[lv][2].target = S[lv][3].target = 1; return; }
-    if (ty == 3) { S[lv][3].target = 1; return; }
-    if (ty == 4) { S[lv][4].target = S[lv][5].target = 1; return; }
-    if (ty == 5) { S[lv][5].target = 1; return; }
-    if (ty == 1) { S[lv][1].target = 1; j = lv + 1; } else S[lv][0].target = 1;
+    if (L[lv].merge && ty != 0) { // on a branch of a merge fork: the rest of that branch, then on to the next forks
+        for (int t = ty; t <= (ty <= 3 ? 3 : 6); t++) S[lv][t].target = 1;
+        j = lv + 1;
+    } else {
+        if (ty == 2) { S[lv][2].target = S[lv][3].target = 1; return; }
+        if (ty == 3) { S[lv][3].target = 1; return; }
+        if (ty == 4) { S[lv][4].target = S[lv][5].target = 1; return; }
+        if (ty == 5) { S[lv][5].target = 1; return; }
+        if (ty == 1) { S[lv][1].target = 1; j = lv + 1; } else S[lv][0].target = 1;
+    }
     // the route followed if the player presses nothing: keep the current side at every fork
     for (; j < gen && j <= lv + 7; j++) {
         if (j > lv) S[j][0].target = 1;
+        if (L[j].end) break; // the road ends here
         int sel = eff_sel(j);
+        if (L[j].merge) { // both branches lead on: the selected side is the one lit
+            for (int t = sel < 0 ? 1 : 4; t <= (sel < 0 ? 3 : 6); t++) S[j][t].target = 1;
+            continue;
+        }
         if (sel == L[j].side) S[j][1].target = 1;
         else if (L[j].three && sel != L[j].dirD) { S[j][4].target = S[j][5].target = 1; break; }
         else { S[j][2].target = S[j][3].target = 1; break; }
@@ -587,8 +754,13 @@ static void compute_targets(void) {
 
 // the segment a segment grows out of: returns its type and its level in *pj, or -1 for the root of the tree
 static int seg_parent(int j, int t, int *pj) {
-    if (t == 0) { *pj = j - 1; return j > 0 ? 1 : -1; }
+    if (t == 0) { // the approach grows out of the previous fork's last segment (in a merge fork: the lit branch's)
+        *pj = j - 1;
+        if (j == 0) return -1;
+        return L[j - 1].merge ? (S[j - 1][3].target ? 3 : 6) : 1;
+    }
     *pj = j;
+    if (L[j].merge) return (t == 1 || t == 4) ? 0 : t - 1;
     return t == 3 ? 2 : (t == 5 ? 4 : 0);
 }
 
@@ -607,11 +779,11 @@ static float seg_len(int j, int t) { return S[j][t].len; }
 static void update_burn(float dt) {
     int lo = win_lo(5), hi = win_hi();
     for (int j = lo; j <= hi; j++)
-        for (int t = 0; t < 6; t++) {
+        for (int t = 0; t < NSEG; t++) {
             if (!S[j][t].burning || S[j][t].burn >= 1) continue;
             // a tip burns after its branch; after a loss the fuse runs through the whole tree, root first
             int pj, p = seg_parent(j, t, &pj);
-            if (p >= 0 && (st == ST_DEAD || t == 3 || t == 5) && S[pj][p].burn < 1) continue;
+            if (p >= 0 && (st == ST_DEAD || L[j].merge || t == 3 || t == 5) && S[pj][p].burn < 1) continue;
             S[j][t].burn = fminf(1, S[j][t].burn + (st == ST_DEAD ? 2.5f : 1.0f) * BURN_SPEED * dt / seg_len(j, t));
         }
 }
@@ -621,7 +793,7 @@ static void burn_audio(int W) {
     int lo = win_lo(5), hi = win_hi(), n = 0;
     float sx = 0;
     for (int j = lo; j <= hi; j++)
-        for (int t = 0; t < 6; t++) {
+        for (int t = 0; t < NSEG; t++) {
             if (!S[j][t].burning || S[j][t].burn >= 1) continue;
             Vector2 a, b;
             seg_geo(j, t, &a, &b);
@@ -636,20 +808,22 @@ static void burn_audio(int W) {
 
 static void anim_yellow(float dt) {
     int lo = win_lo(1), hi = win_hi();
+    if (st == ST_WON) { // arrived: no yellow route at all (it must not animate away)
+        for (int j = lo; j <= hi; j++) for (int t = 0; t < NSEG; t++) S[j][t].fill = 0;
+        return;
+    }
     compute_targets();
     int ty = (int)kind, playing = st == ST_PLAY || st == ST_ZOOM;
     // burnt away behind the player: gone instantly
     if (st != ST_INTRO) {
-        for (int j = 0; j < lv && j <= hi; j++) for (int t = 0; t < 6; t++) S[j][t].fill = 0;
-        if (ty != 0) S[lv][0].fill = 0;
-        if (ty == 3) S[lv][2].fill = 0;
-        if (ty == 5) S[lv][4].fill = 0;
+        for (int j = 0; j < lv && j <= hi; j++) for (int t = 0; t < NSEG; t++) S[j][t].fill = 0;
+        for (int q = ty, pj, p; (p = seg_parent(lv, q, &pj)) >= 0 && pj == lv; q = p) S[lv][p].fill = 0; // segments already passed
         if (playing) S[lv][ty].fill = 1;
     }
     int retracting = 0;
-    for (int j = lo; j <= hi; j++) for (int t = 0; t < 6; t++) if (!S[j][t].target && S[j][t].fill > 0) retracting = 1;
+    for (int j = lo; j <= hi; j++) for (int t = 0; t < NSEG; t++) if (!S[j][t].target && S[j][t].fill > 0) retracting = 1;
     for (int j = hi; j >= lo; j--)
-        for (int t = 5; t >= 0; t--) {
+        for (int t = NSEG - 1; t >= 0; t--) {
             float *f = &S[j][t].fill;
             if (!S[j][t].target) {
                 if (*f <= 0) continue;
@@ -672,26 +846,29 @@ static void draw_fills(void) {
     } else {
         int ty = (int)kind;
         for (int j = win_lo(3); j <= win_hi(); j++)
-            for (int t = 0; t < 6; t++) {
-                if (t >= 4 && !L[j].three) continue;
+            for (int t = 0; t < NSEG; t++) {
+                if (!seg_exists(j, t)) continue;
                 if (S[j][t].burn >= 1) continue;
                 int red = j > lv ? 1 : (j == lv && ty == 0 ? t >= 1 : S[j][t].alt);
                 if (!red) continue;
                 seg_geo(j, t, &a, &b);
-                put_seg(uR, &nuR, MAXRS, Vector2Lerp(a, b, S[j][t].burn), b);
+                put_seg_j(uR, &nuR, MAXRS, j, t, Vector2Lerp(a, b, S[j][t].burn), b);
             }
     }
     // yellow: animated route
     int ylo = win_lo(1), yhi = win_hi(), ty = (int)kind;
     for (int j = ylo; j <= yhi; j++)
-        for (int t = 0; t < 6; t++) {
+        for (int t = 0; t < NSEG; t++) {
             float f = S[j][t].fill;
             if (f <= 0) continue;
             seg_geo(j, t, &a, &b);
             if ((st == ST_PLAY || st == ST_ZOOM) && j == lv && t == ty) a = pos;
-            put_seg(uY, &nuY, MAXYS, a, Vector2Lerp(a, b, f));
+            put_seg_j(uY, &nuY, MAXYS, j, t, a, Vector2Lerp(a, b, f));
         }
 }
+
+// 0 -> 1 after the player has stopped at the end of the road: the road's glowing outlines fade away, leaving the circle
+static float arrival_fade(void) { return ease(Clamp((winT - 0.8f) / 1.6f, 0, 1)); }
 
 // Collects what is on screen and renders the whole path with the shader.
 static void render_world(Camera2D c, int W, int H) {
@@ -708,6 +885,8 @@ static void render_world(Camera2D c, int W, int H) {
     if (zoom != lastZoom) { lastZoom = zoom; SetShaderValue(pathShader, locZoom, &zoom, SHADER_UNIFORM_FLOAT); }
     if (scrH != lastH) { lastH = scrH; SetShaderValue(pathShader, locScrH, &scrH, SHADER_UNIFORM_FLOAT); }
     SetShaderValue(pathShader, locPulse, &pulse, SHADER_UNIFORM_FLOAT);
+    float fade = st == ST_WON ? 1.0f - arrival_fade() : 1.0f; // the glowing outlines fade out after the arrival
+    SetShaderValue(pathShader, locFade, &fade, SHADER_UNIFORM_FLOAT);
     float tm = fmodf(tnow, 1000.0f);
     SetShaderValue(pathShader, locTime, &tm, SHADER_UNIFORM_FLOAT);
     if (pw != lastPw) { lastPw = pw; SetShaderValue(pathShader, locPw, &pw, SHADER_UNIFORM_FLOAT); }
@@ -794,7 +973,7 @@ static void reset_game(void) {
     to = L[0].F;
     kind = K_APPROACH;
     lv = 0; choice = 0; lastSide = 1; speed = baseSpeed(0);
-    introSel = 0; runT = 0;
+    introSel = 0; runT = 0; winT = 0; firstMerge = -1; mergesPassed = 0; mergeZoom = 1;
     deathBurn = 0; flash = 0; shake = 0;
     for (int i = 0; i < MAXP; i++) parts[i].life = 0;
     st = ST_INTRO;
@@ -803,6 +982,13 @@ static void reset_game(void) {
 static void spawn_spark(Vector2 p, Vector2 v, float life, Color c, float size) {
     for (int i = 0; i < MAXP; i++)
         if (parts[i].life <= 0) { parts[i] = (Particle){p, v, life, life, c, size}; return; }
+}
+
+// the end of the road: the player stops at the dead end and wins
+static void win(void) {
+    st = ST_WON; winT = 0;
+    if (lv > best[hard]) best[hard] = lv;
+    sfxp(sWin, 0, 1.0f);
 }
 
 static void crash(void) {
@@ -817,15 +1003,56 @@ static void crash(void) {
     }
 }
 
+// the player reached the end of a fork (the node after its last segment): score and move on to the next fork
+static int pass_fork(void) {
+    if (L[lv].merge) mergesPassed++;
+    lv++; scorePop = 1;
+    for (int k = 0; k < 28; k++) { // celebratory burst at the node we just crossed
+        float a = frand(0, 2 * PI), v = frand(60, 320);
+        spawn_spark(pos, (Vector2){cosf(a) * v, sinf(a) * v}, frand(0.3f, 0.7f), GetRandomValue(0, 1) ? FYEL : PAL[lv % PAL_N], 0.6f);
+    }
+    ensure_gen(lv + 8);
+    if (lv >= gen - 1 && lv != WIN_SCORE) { crash(); return 0; } // end of generated world
+    to = L[lv].F; kind = K_APPROACH;
+    speed = baseSpeed(lv);
+    return 1;
+}
+
+// merge fork: at the fork pick the left (segments 1-3) or right (4-6) branch, then walk its segments in order
+static int merge_step(void) {
+    Vector2 a;
+    if (kind == K_APPROACH) {
+        S[lv][0].burning = 1; // the approach behind us can no longer be selected
+        int left = eff_sel(lv) < 0;
+        for (int t = left ? 4 : 1; t <= (left ? 6 : 3); t++) S[lv][t].burning = S[lv][t].alt = 1; // the other branch burns away
+        kind = left ? (Kind)1 : (Kind)4;
+        seg_geo(lv, kind, &a, &to);
+        return 1;
+    }
+    S[lv][kind].burning = 1;
+    if (kind == 3 || kind == 6) return pass_fork();
+    kind = (Kind)(kind + 1);
+    seg_geo(lv, kind, &a, &to);
+    return 1;
+}
+
 static void advance(float dt) {
+    if (L[lv].end && kind == K_APPROACH) // the last stretch: ease to a gentle stop at the end of the road
+        speed = fmaxf(35.0f, baseSpeed(lv) * Clamp(Vector2Distance(pos, to) / 380.0f, 0, 1));
     float rem = speed * dt;
     while (rem > 0 && (st == ST_PLAY || st == ST_ZOOM)) {
         float d = Vector2Distance(pos, to);
         if (d > rem) {
+            Vector2 before = pos;
             pos = Vector2Add(pos, Vector2Scale(Vector2Normalize(Vector2Subtract(to, pos)), rem));
+            int gt = (int)kind;
+            // stepping onto a gap the orb is far from: fall. (Once on it, the orb waits there until you are through.)
+            if (has_gap(lv, gt) && gap_deadly(lv, gt) && !in_gap_area(lv, gt, before) && in_gap_area(lv, gt, pos)) { crash(); return; }
             break;
         }
         pos = to; rem -= d;
+        if (L[lv].end) { win(); return; }
+        if (L[lv].merge) { if (!merge_step()) return; continue; }
         switch (kind) {
         case K_APPROACH: { // reached the fork: commit to the chosen side
             Level *m = &L[lv];
@@ -846,20 +1073,13 @@ static void advance(float dt) {
         } break;
         case K_TRUE:
             S[lv][1].burning = 1; // the branch we just left
-            lv++; scorePop = 1;
-            for (int k = 0; k < 28; k++) { // celebratory burst at the node we just crossed
-                float a = frand(0, 2 * PI), v = frand(60, 320);
-                spawn_spark(pos, (Vector2){cosf(a) * v, sinf(a) * v}, frand(0.3f, 0.7f), GetRandomValue(0, 1) ? FYEL : PAL[lv % PAL_N], 0.6f);
-            }
-            ensure_gen(lv + 8);
-            if (lv >= gen - 1) { crash(); return; } // end of generated world
-            to = L[lv].F; kind = K_APPROACH;
-            speed = baseSpeed(lv);
+            if (!pass_fork()) return;
             break;
         case K_D1: to = L[lv].D2; kind = K_D2; break;
         case K_D2: crash(); return;
         case K_E1: to = L[lv].E2; kind = K_E2; break;
         case K_E2: crash(); return;
+        default: break; // K_X6 only occurs in merge forks (handled in merge_step)
         }
     }
 }
@@ -881,6 +1101,16 @@ static int branch_dir_at(Vector2 w, int j) {
     if (w.y > m->F.y - 40) { // below the fork: decide by the horizontal offset from the fork
         float dx = w.x - m->F.x;
         return m->three ? (dx < -70 ? -1 : (dx > 70 ? 1 : 0)) : (dx < 0 ? -1 : 1);
+    }
+    if (m->merge) { // left branch (types 1-3) or right branch (4-6): whichever is nearer
+        float dl = 1e9f, dr = 1e9f;
+        for (int t = 1; t <= 6; t++) {
+            Vector2 a, b;
+            seg_geo(j, t, &a, &b);
+            float d = dist_seg(w, a, b);
+            if (t <= 3) dl = fminf(dl, d); else dr = fminf(dr, d);
+        }
+        return dl < dr ? -1 : 1;
     }
     float best = dist_seg(w, m->F, m->N);
     int dir = m->side;
@@ -1009,6 +1239,7 @@ static void apply_selection(const Input *in, int W) {
     if (st == ST_PLAY) {
         // the next fork decides the layout: 3-way forks step left/middle/right, 2-way forks jump to a side
         int upc = next_fork();
+        if (upc < gen && L[upc].end) return; // no more forks
         int three = upc < gen && L[upc].three, nc = choice, changed = 0;
         if (in->keyPick) { nc = three ? (int)Clamp((float)(choice + in->keyPick), -1, 1) : in->keyPick; changed = 1; }
         else if (upc < gen) {
@@ -1048,7 +1279,7 @@ static void update_particles(float dt) {
 
 // drive the streamed audio bed from the game state
 static void update_audio(int W) {
-    aud_drone = (st == ST_PLAY || st == ST_ZOOM) ? 1.0f : (st == ST_INTRO ? 0.35f : 0.0f);
+    aud_drone = (st == ST_PLAY || st == ST_ZOOM) ? 1.0f : (st == ST_INTRO || st == ST_WON ? 0.35f : 0.0f);
     aud_speed = speed;
     aud_lean = 0;
     if (st == ST_PLAY || st == ST_ZOOM) {
@@ -1066,7 +1297,15 @@ static void update_camera(float dt, int W, int H, float zs) {
     float introZ = fminf(0.70f * H / 760.0f, 0.9f * W / 640.0f);
     // start zoomed out (easier), then slowly zoom in until the maximum is reached
     const Diff *dif = &DIFF[hard];
-    float Zg = Lerp(dif->zStart, dif->zMax, ease(Clamp(runT / dif->zSecs, 0, 1))) * zs;
+    if (firstMerge < 0)
+        for (int j = lv; j <= win_hi(); j++) if (L[j].merge) { firstMerge = j; break; }
+    float mzTarget = 1;
+    if (firstMerge >= 0 && lv >= firstMerge - 3) { // zoom out shortly before the first merge fork, then back in over time
+        float back = fmaxf(Clamp((mergesPassed - 2) / 4.0f, 0, 1), Clamp((lv - firstMerge - 20) / 15.0f, 0, 1));
+        mzTarget = Lerp(0.72f, 1.0f, back);
+    }
+    mergeZoom += (mzTarget - mergeZoom) * fminf(1, 1.2f * dt);
+    float Zg = Lerp(dif->zStart, dif->zMax, ease(Clamp(runT / dif->zSecs, 0, 1))) * zs * mergeZoom;
     cam.offset = (Vector2){W / 2.0f, H / 2.0f};
     if (st == ST_INTRO) {
         float k = fminf(1, 5 * dt);
@@ -1090,7 +1329,7 @@ static void update_game(float dt, int W, int H, float zs, const Input *in) {
     if (st == ST_INTRO) {
         if (in->pick) {
             startSide = choice = lastSide = in->pick; hard = in->pick > 0;
-            gen = 0; ensure_gen(10);
+            gen = 0; ensure_gen(10); firstMerge = -1;
             speed = baseSpeed(0);
             st = ST_ZOOM; zoomT = 0; sfxp(sStart, 0, DIFF[hard].startPitch);
         }
@@ -1103,15 +1342,19 @@ static void update_game(float dt, int W, int H, float zs, const Input *in) {
         if (zoomT >= 1.6f) { st = ST_PLAY; speed = baseSpeed(lv); }
     } else if (st == ST_PLAY) {
         advance(dt);
+    } else if (st == ST_WON) {
+        winT += dt;
+        if (winT > 1.5f && in->confirm) reset_game();
     } else if (st == ST_DEAD) {
         deadT += dt;
         if (deadT > 0.6f && !deathBurn) { // after a beat, every remaining path burns away from its root
             deathBurn = 1;
             for (int j = win_lo(5); j <= win_hi(); j++)
-                for (int t = 0; t < 6; t++) S[j][t].burning = 1;
+                for (int t = 0; t < NSEG; t++) S[j][t].burning = 1;
         }
         if (deadT > 0.7f && in->confirm) reset_game();
     }
+    update_orbs(dt);
     update_particles(dt);
     scorePop = fmaxf(0, scorePop - dt * 3);
     update_audio(W);
@@ -1142,12 +1385,40 @@ static void draw_intro_labels(float a) {
     }
 }
 
+// A blob like a missing piece of path, drawn like a cross-section of the tube as wide as the path: neon outline in
+// the path's colour, a dark rim, and the fill inside (a little brighter at its edge, like the path fills).
+// Used for the orbs in merge forks and for the circle that marks the arrival at the end of the road.
+static void draw_blob(Vector2 c, float scale, float vis, float edgeVis, Color edge, Color fill) {
+    float r = PATH_W / 2 * scale, rf = fmaxf(r - 8 * scale, 0);
+    BeginBlendMode(BLEND_ADDITIVE);
+    DrawCircleGradient(c, PATH_W * 0.95f * scale, Fade(edge, 0.6f * vis * edgeVis), BLANK); // glow, like the path's edge glow
+    EndBlendMode();
+    DrawCircleSector(c, r, 0, 360, 64, Fade(edge, vis * edgeVis));
+    DrawCircleSector(c, fmaxf(r - 5 * scale, 0), 0, 360, 64, Fade(BLACK, vis * edgeVis));
+    DrawCircleSector(c, rf, 0, 360, 64, Fade(mix_color(fill, WHITE, 0.25f), vis));
+    DrawCircleSector(c, fmaxf(rf - 7 * scale, 0), 0, 360, 64, Fade(fill, vis));
+}
+
 static void draw_world(Camera2D c, int W, int H) {
     render_world(c, W, H);
     BeginMode2D(c);
     if (st == ST_INTRO || st == ST_ZOOM) {
         float a = st == ST_INTRO ? 0.8f + 0.2f * sinf(tnow * 4) : Clamp(1 - zoomE * 2.2f, 0, 1);
         if (a > 0) draw_intro_labels(a);
+    }
+    for (int j = win_lo(2); j <= win_hi(); j++) { // the orb(s) travelling between the gaps of merge forks
+        if (!L[j].merge) continue;
+        Vector2 ca = Vector2Lerp(L[j].D1, L[j].D2, 0.5f), cb = Vector2Lerp(L[j].E1, L[j].E2, 0.5f);
+        if (!CheckCollisionPointRec(Vector2Lerp(ca, cb, 0.5f), viewR)) continue;
+        // hidden while it sits in a gap (the filled gap is the orb); it appears as it leaves and disappears as it arrives
+        float vis = Clamp((fminf(L[j].orbF, 1.0f - L[j].orbF) - 0.05f) / 0.15f, 0, 1);
+        // when the branches burn away the orb shrinks fast: the burn front passing the gaps (20%..50% of the middle segments)
+        float burnt = fmaxf(S[j][2].burn, S[j][5].burn);
+        float scale = Clamp(1.0f - (burnt - 0.2f) / 0.3f, 0, 1);
+        if (vis <= 0 || scale <= 0.01f) continue;
+        Color oc = mix_color(FREDC, FYEL, L[j].orbHue); // red <-> yellow, following the branch it is heading to
+        Vector2 op = Vector2Lerp(ca, cb, L[j].orbF);
+        draw_blob(op, scale, vis, 1.0f, PAL[(j + 1) % PAL_N], oc);
     }
     BeginBlendMode(BLEND_ADDITIVE);
     if (st == ST_PLAY || st == ST_ZOOM) { // glowing head of the fuse
@@ -1165,7 +1436,7 @@ static void draw_world(Camera2D c, int W, int H) {
 
 // fog of war: the view shrinks as you progress
 static void draw_fog(int W, int H) {
-    float k = st == ST_ZOOM ? zoomE : (st == ST_INTRO ? 0.0f : 1.0f);
+    float k = st == ST_ZOOM ? zoomE : (st == ST_INTRO ? 0.0f : (st == ST_WON ? Clamp(1.0f - winT, 0, 1) : 1.0f));
     if (k <= 0) return;
     const Diff *dif = &DIFF[hard];
     Vector2 sp = GetWorldToScreen2D(pos, cam);
@@ -1192,10 +1463,9 @@ static void draw_hud(int W, int H) {
             const Run r[] = {{"BEST ", &faceUI}, {TextFormat("%d", best[hard]), &faceNum}};
             NeonRun((Vector2){W / 2.0f, 142 * uiS}, 22, WHITE, 0.9f, r, 2);
         }
-        if (st != ST_DEAD) {
-            int upc = next_fork();
+        int upc = next_fork();
+        if (st != ST_DEAD && st != ST_WON && !(upc < gen && L[upc].end))
             draw_arrows(W, H, upc < gen ? eff_sel(upc) : choice, upc < gen && L[upc].three);
-        }
     }
     if (st == ST_DEAD && deadT > 0.35f) {
         float a = Clamp((deadT - 0.35f) * 3, 0, 1);
@@ -1205,6 +1475,17 @@ static void draw_hud(int W, int H) {
         NeonRun((Vector2){W / 2.0f, H * 0.5f}, 36, WHITE, a, r, 4);
         if (deadT > 0.7f && fmodf(tnow, 1.2f) < 0.8f)
             NeonText(kbHint ? "SPACE OR CLICK TO CHOOSE AGAIN" : "TAP TO CHOOSE AGAIN", (Vector2){W / 2.0f, H * 0.6f}, 30, PAL[0], 0.9f);
+    }
+    if (st == ST_WON && winT > 1.0f) { // the ending
+        float a = Clamp((winT - 1.0f) * 2, 0, 1), y = H * 0.44f, gap = 46 * uiS;
+        DrawRectangle(0, 0, W, H, Fade(BLACK, 0.55f * a));
+        NeonTextF(&faceTitle, "RIGHT TURN", (Vector2){W / 2.0f, H * 0.28f}, 84, PAL[2], a);
+        NeonText(hard ? "That's impressive!" : "You're amazing!", (Vector2){W / 2.0f, y}, 36, WHITE, a);
+        NeonText("But every trip has an end of the road.", (Vector2){W / 2.0f, y + gap}, 28, WHITE, a * 0.95f);
+        NeonText("Take a rest before your next turn.", (Vector2){W / 2.0f, y + 2 * gap}, 28, WHITE, a * 0.95f);
+        if (!hard) NeonText("You can try the hard mode next time.", (Vector2){W / 2.0f, y + 3.4f * gap}, 26, PAL[1], a);
+        if (winT > 2.5f && fmodf(tnow, 1.2f) < 0.8f)
+            NeonText(kbHint ? "SPACE OR CLICK TO PLAY AGAIN" : "TAP TO PLAY AGAIN", (Vector2){W / 2.0f, H * 0.86f}, 26, PAL[0], 0.9f);
     }
     if (flash > 0) DrawRectangle(0, 0, W, H, Fade(WHITE, flash));
 }
@@ -1240,6 +1521,11 @@ static void frame(void) {
     draw_world(c, W, H);
     draw_fog(W, H);
     draw_hud(W, H);
+    if (st == ST_WON) { // arrived safely: the player stops and leaves a circle. Drawn above the ending's dark overlay so it stays vivid
+        BeginMode2D(c);
+        draw_blob(pos, 1.0f, 1.0f, 1.0f, PAL[lv % PAL_N], FYEL);
+        EndMode2D();
+    }
     EndDrawing();
 }
 
@@ -1263,7 +1549,7 @@ int main(void) {
     pathShader = LoadShaderFromMemory(NULL, pathFs);
     locCamT = GetShaderLocation(pathShader, "camT"); locCamOff = GetShaderLocation(pathShader, "camOff");
     locZoom = GetShaderLocation(pathShader, "zoom"); locScrH = GetShaderLocation(pathShader, "scrH");
-    locPulse = GetShaderLocation(pathShader, "pulse"); locTime = GetShaderLocation(pathShader, "time"); locPw = GetShaderLocation(pathShader, "pw");
+    locPulse = GetShaderLocation(pathShader, "pulse"); locTime = GetShaderLocation(pathShader, "time"); locPw = GetShaderLocation(pathShader, "pw"); locFade = GetShaderLocation(pathShader, "pathFade");
     locNP = GetShaderLocation(pathShader, "nP"); locNR = GetShaderLocation(pathShader, "nR"); locNY = GetShaderLocation(pathShader, "nY");
     locP = GetShaderLocation(pathShader, "pSeg"); locPc = GetShaderLocation(pathShader, "pCol");
     locR = GetShaderLocation(pathShader, "rSeg"); locY = GetShaderLocation(pathShader, "ySeg");
