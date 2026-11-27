@@ -63,6 +63,7 @@ static Particle parts[MAXP];
 static int introSel, deathBurn;
 #define BURN_SPEED 1000.0f
 static const Color FYEL = {255, 240, 40, 255}; // the fuse yellow (the red and yellow fills themselves live in the path shader)
+static const Color FGREEN = {60, 255, 130, 255}; // calm: the end of the road (red = danger, yellow = a decision to make, green = safe)
 static const Color FREDC = {255, 30, 50, 255}; // the red of the branches that are not selected (orbs follow the same colours)
 static State st;
 static Kind kind;
@@ -406,6 +407,12 @@ static int put_seg(float *arr, int *n, int cap, Vector2 a, Vector2 b);
 #define ORB_TRAVEL 0.1f
 #define GAP_A 0.2f // the gap spans this part of the middle segment, as fractions of its length
 #define GAP_B 0.8f
+// 0 -> 1 while the player runs along the last stretch of the road (and 1 once arrived): everything turns green
+static float end_progress(void) {
+    if (st == ST_WON) return 1.0f;
+    if ((st != ST_PLAY && st != ST_ZOOM) || !L[lv].end || kind != K_APPROACH) return 0.0f;
+    return ease(Clamp(1.0f - Vector2Distance(pos, to) / fmaxf(S[lv][0].len, 1.0f), 0, 1));
+}
 static int has_gap(int j, int t) { return L[j].merge && (t == 2 || t == 5); }
 static void gap_tip(int j, int t, Vector2 *A, Vector2 *u, float *len) { // start, unit direction and length of the middle segment
     Vector2 B = t == 2 ? L[j].D2 : L[j].E2;
@@ -461,7 +468,10 @@ static void update_orbs(float dt) {
     }
 }
 // A gap is drawn closed only while the orb really sits in it. (So the orb is visible exactly while a gap is open.)
-static int gap_open(int j, int t) { return t == 2 ? L[j].orbF > 0.12f : L[j].orbF < 0.88f; }
+static int gap_open(int j, int t) {
+    if (crossing_gap(j) == t) return 0; // a gap the player is crossing never looks open (the orb is on its way)
+    return t == 2 ? L[j].orbF > 0.12f : L[j].orbF < 0.88f;
+}
 // Stepping onto a gap only kills if the orb is far from it: when the orb is within reach (it is on its way there or
 // has just left) it rushes in and fills the gap for the player. Leaving one gap and arriving at the other overlap in
 // the middle of the trip, so at any moment the player can safely cross at least one of the two.
@@ -561,20 +571,20 @@ static void ensure_gen(int n) { while (gen <= n && gen <= WIN_SCORE && gen < MAX
 // ---------------------------------------------------------------- drawing
 // The whole path (neon tubes, red/yellow fills, glow) is rendered in ONE fragment shader from signed
 // distances to the segments, so there are no overlapping translucent shapes and no visible circles.
-#define MAXPS 56
-#define MAXRS 48
+#define MAXPS 64
+#define MAXRS 56
 #define MAXYS 32
 static float uP[MAXPS * 4], uPc[MAXPS * 3], uR[MAXRS * 4], uY[MAXYS * 4];
 static int nuP, nuR, nuY;
 static Rectangle viewR; // visible world rectangle (+ margin), used to skip off-screen segments
 static Shader pathShader;
-static int locCamT, locCamOff, locZoom, locScrH, locPulse, locTime, locPw, locFade, locNP, locNR, locNY, locP, locPc, locR, locY;
+static int locCamT, locCamOff, locZoom, locScrH, locPulse, locTime, locPw, locFade, locYelCol, locNP, locNR, locNY, locP, locPc, locR, locY;
 
 #define STR_(x) #x
 #define STR(x) STR_(x)
 static const char *pathFs =
     GLSL_HEAD
-    "uniform vec2 camT, camOff;\nuniform float zoom, scrH, pulse, pw, time, pathFade;\n"
+    "uniform vec2 camT, camOff;\nuniform float zoom, scrH, pulse, pw, time, pathFade;\nuniform vec3 yelCol;\n"
     "uniform int nP, nR, nY;\n"
     "uniform vec4 pSeg[" STR(MAXPS) "];\nuniform vec3 pCol[" STR(MAXPS) "];\n"
     "uniform vec4 rSeg[" STR(MAXRS) "];\nuniform vec4 ySeg[" STR(MAXYS) "];\n"
@@ -634,7 +644,7 @@ static const char *pathFs =
     "    for (int i = 0; i < " STR(MAXYS) "; i++) { if (i >= nY) break; fyv = min(fyv, sdSeg(p, ySeg[i])); }\n"
     "    float fw = (pw - 16.0) * 0.5;\n"
     "    float dr = fr - fw, dy = fyv - fw;\n"
-    "    vec3 red = vec3(1.0, 0.12, 0.2), yel = vec3(1.0, 0.94, 0.16);\n"
+    "    vec3 red = vec3(1.0, 0.12, 0.2), yel = yelCol;\n"
     "    float cr = 1.0 - smoothstep(-aa, aa, dr), cy = 1.0 - smoothstep(-aa, aa, dy);\n"
     "    col = mix(col, red * (0.8 + 0.35 * exp(min(dr, 0.0) * zoom / 8.0)), cr);\n"
     "    col = mix(col, yel * (0.8 + 0.35 * exp(min(dy, 0.0) * zoom / 8.0)), cy);\n"
@@ -670,6 +680,7 @@ static void draw_path(void) {
             seg_geo(j, t, &a, &b);
             a = Vector2Lerp(a, b, S[j][t].burn); // burnt away from the root
             Color c = t == 0 ? PAL[j % PAL_N] : PAL[(j + 1) % PAL_N];
+            if (L[j].end) c = mix_color(c, FGREEN, end_progress()); // the last road gradually turns green
             int k = put_seg_j(uP, &nuP, MAXPS, j, t, a, b); // k pieces (more than one when a gap splits it)
             for (int q = 1; q <= k; q++) {
                 float *pc = uPc + (nuP - q) * 3;
@@ -757,7 +768,7 @@ static int seg_parent(int j, int t, int *pj) {
     if (t == 0) { // the approach grows out of the previous fork's last segment (in a merge fork: the lit branch's)
         *pj = j - 1;
         if (j == 0) return -1;
-        return L[j - 1].merge ? (S[j - 1][3].target ? 3 : 6) : 1;
+        return L[j - 1].merge ? (branch_lit(j - 1, 0) ? 3 : 6) : 1; // the branch that was (or will be) taken
     }
     *pj = j;
     if (L[j].merge) return (t == 1 || t == 4) ? 0 : t - 1;
@@ -767,7 +778,7 @@ static int seg_parent(int j, int t, int *pj) {
 // is any segment that grows out of (j, t) still filled? (a segment only retracts once everything beyond it is empty)
 static int child_lit(int j, int t, int hi) {
     for (int j2 = j; j2 <= j + 1 && j2 <= hi; j2++)
-        for (int t2 = 0; t2 < 6; t2++) {
+        for (int t2 = 0; t2 < NSEG; t2++) {
             int pj, p = seg_parent(j2, t2, &pj);
             if (p == t && pj == j && S[j2][t2].fill > 0) return 1;
         }
@@ -887,6 +898,8 @@ static void render_world(Camera2D c, int W, int H) {
     SetShaderValue(pathShader, locPulse, &pulse, SHADER_UNIFORM_FLOAT);
     float fade = st == ST_WON ? 1.0f - arrival_fade() : 1.0f; // the glowing outlines fade out after the arrival
     SetShaderValue(pathShader, locFade, &fade, SHADER_UNIFORM_FLOAT);
+    float ep = end_progress(), yc[3] = {Lerp(1.0f, 60 / 255.0f, ep), Lerp(0.94f, 1.0f, ep), Lerp(0.16f, 130 / 255.0f, ep)}; // yellow -> green at the end
+    SetShaderValue(pathShader, locYelCol, yc, SHADER_UNIFORM_VEC3);
     float tm = fmodf(tnow, 1000.0f);
     SetShaderValue(pathShader, locTime, &tm, SHADER_UNIFORM_FLOAT);
     if (pw != lastPw) { lastPw = pw; SetShaderValue(pathShader, locPw, &pw, SHADER_UNIFORM_FLOAT); }
@@ -1422,7 +1435,7 @@ static void draw_world(Camera2D c, int W, int H) {
     }
     BeginBlendMode(BLEND_ADDITIVE);
     if (st == ST_PLAY || st == ST_ZOOM) { // glowing head of the fuse
-        DrawCircleGradient(pos, 70, Fade(FYEL, 0.55f), BLANK);
+        DrawCircleGradient(pos, 70, Fade(mix_color(FYEL, FGREEN, end_progress()), 0.55f), BLANK);
         DrawCircleGradient(pos, 26, Fade(WHITE, 0.8f), BLANK);
     }
     for (int i = 0; i < MAXP; i++)
@@ -1479,7 +1492,7 @@ static void draw_hud(int W, int H) {
     if (st == ST_WON && winT > 1.0f) { // the ending
         float a = Clamp((winT - 1.0f) * 2, 0, 1), y = H * 0.44f, gap = 46 * uiS;
         DrawRectangle(0, 0, W, H, Fade(BLACK, 0.55f * a));
-        NeonTextF(&faceTitle, "RIGHT TURN", (Vector2){W / 2.0f, H * 0.28f}, 84, PAL[2], a);
+        NeonTextF(&faceTitle, "RIGHT TURN", (Vector2){W / 2.0f, H * 0.28f}, 84, FGREEN, a);
         NeonText(hard ? "That's impressive!" : "You're amazing!", (Vector2){W / 2.0f, y}, 36, WHITE, a);
         NeonText("But every trip has an end of the road.", (Vector2){W / 2.0f, y + gap}, 28, WHITE, a * 0.95f);
         NeonText("Take a rest before your next turn.", (Vector2){W / 2.0f, y + 2 * gap}, 28, WHITE, a * 0.95f);
@@ -1523,7 +1536,7 @@ static void frame(void) {
     draw_hud(W, H);
     if (st == ST_WON) { // arrived safely: the player stops and leaves a circle. Drawn above the ending's dark overlay so it stays vivid
         BeginMode2D(c);
-        draw_blob(pos, 1.0f, 1.0f, 1.0f, PAL[lv % PAL_N], FYEL);
+        draw_blob(pos, 1.0f, 1.0f, 1.0f, FGREEN, FGREEN);
         EndMode2D();
     }
     EndDrawing();
@@ -1549,7 +1562,7 @@ int main(void) {
     pathShader = LoadShaderFromMemory(NULL, pathFs);
     locCamT = GetShaderLocation(pathShader, "camT"); locCamOff = GetShaderLocation(pathShader, "camOff");
     locZoom = GetShaderLocation(pathShader, "zoom"); locScrH = GetShaderLocation(pathShader, "scrH");
-    locPulse = GetShaderLocation(pathShader, "pulse"); locTime = GetShaderLocation(pathShader, "time"); locPw = GetShaderLocation(pathShader, "pw"); locFade = GetShaderLocation(pathShader, "pathFade");
+    locPulse = GetShaderLocation(pathShader, "pulse"); locTime = GetShaderLocation(pathShader, "time"); locPw = GetShaderLocation(pathShader, "pw"); locFade = GetShaderLocation(pathShader, "pathFade"); locYelCol = GetShaderLocation(pathShader, "yelCol");
     locNP = GetShaderLocation(pathShader, "nP"); locNR = GetShaderLocation(pathShader, "nR"); locNY = GetShaderLocation(pathShader, "nY");
     locP = GetShaderLocation(pathShader, "pSeg"); locPc = GetShaderLocation(pathShader, "pCol");
     locR = GetShaderLocation(pathShader, "rSeg"); locY = GetShaderLocation(pathShader, "ySeg");
