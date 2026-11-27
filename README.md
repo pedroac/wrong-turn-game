@@ -3,6 +3,8 @@
 A small neon game made with [raylib](https://www.raylib.com/). A fuse burns up a path that keeps forking.
 Pick the branch that continues and avoid the dead ends. Choose wrong and the whole tree burns away.
 
+![screenshot](screenshot.png)
+
 ## Play
 
 - **Intro:** choose a difficulty by picking a side: left is easy, right is hard.
