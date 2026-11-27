@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+#include <stdio.h>
 #ifdef PLATFORM_WEB
 #include <emscripten/emscripten.h>
 #endif
@@ -30,15 +31,37 @@
 #endif
 #define MERGE_FINALE 10 // the last forks before the end of the road are all merge forks
 
+// Calm stretches: at these forks the road is a safe, steady path for a few seconds, with a message that fades in and out.
+typedef struct { int level; const char *msg; } CalmMsg;
+static const CalmMsg CALM[] = {
+    {50, "Good calls, steady trip."},
+    {100, "Sometimes the right turn is waiting for the passage to open."},
+    {300, "A trip needs rhythm."},
+    {500, "Still on track. Keep choosing fast."},
+    {WIN_SCORE - MERGE_FINALE - 1, "Narrower passages ahead. Rhythm over rush."}, // just before the run of merge forks
+};
+static const char *calm_msg(int i) {
+    for (unsigned k = 0; k < sizeof CALM / sizeof CALM[0]; k++) if (CALM[k].level == i) return CALM[k].msg;
+    return NULL;
+}
+
+// Why the run ended, for the message on the WRONG TURN screen. Per fork we count how often the player changed their
+// selection and when they last did; at the moment of committing that tells hesitation from not reacting at all.
+#define HESITATE_CHANGES 3     // this many changes at one fork = picking sides several times
+#define HESITATE_LATE 0.4f     // a change this close to the fork (seconds) = deciding in the last fraction of a second
+static int forkChanges, commitHesitated, commitNoPress;
+static float forkLastChange;
+static const char *lossMsg;
+
 static const Color PAL[PAL_N] = {
     {0, 255, 255, 255}, {255, 40, 200, 255}, {120, 255, 40, 255},
     {255, 150, 0, 255}, {150, 90, 255, 255}, {255, 240, 40, 255}};
 
 // A fork has a real branch N (direction `side`, -1 left / 0 middle / +1 right) and one or two dead ends (D, E).
-// `end`: the last stretch of the road, a dead end with no branches (the player wins on reaching it).
+// `calm`: a safe, steady stretch with no fork, with a message (see CALM). `end`: the last stretch of the road, a dead end with no branches (the player wins on reaching it).
 // `merge`: the two branches split and join again at N, both lead on, but the middle of each blinks open/closed
 // (the left branch is D1/D2, the right one E1/E2); an orb travels between the two gaps and fills the one it is in.
-typedef struct { Vector2 P, F, N, D1, D2, E1, E2; int side, dirD, three, merge, end; float S, gapPhase, orbF, orbVel, orbHue; } Level;
+typedef struct { Vector2 P, F, N, D1, D2, E1, E2; int side, dirD, three, merge, end, calm; float S, gapPhase, orbF, orbVel, orbHue; } Level;
 typedef struct { Vector2 pos, vel; float life, max; Color col; float size; } Particle;
 typedef enum { ST_INTRO, ST_ZOOM, ST_PLAY, ST_DEAD, ST_WON } State;
 // Which segment of a fork the player is on. The values double as segment types in the per-segment arrays:
@@ -394,7 +417,7 @@ static void make_dead(Level *l, int dir, float a, float T, float maxDepth, int i
 static int win_hi(void) { return lv + 8 < gen ? lv + 8 : gen - 1; }
 static int win_lo(int back) { return lv > back ? lv - back : 0; }
 // does segment (j, t) exist? (type 6 and the middle types differ between fork shapes)
-static int seg_exists(int j, int t) { return L[j].end ? t == 0 : L[j].merge ? 1 : (t < 4 || (t < 6 && L[j].three)); }
+static int seg_exists(int j, int t) { return (L[j].end || L[j].calm) ? t == 0 : L[j].merge ? 1 : (t < 4 || (t < 6 && L[j].three)); }
 static void seg_geo(int j, int t, Vector2 *a, Vector2 *b);
 
 static int put_seg(float *arr, int *n, int cap, Vector2 a, Vector2 b);
@@ -408,10 +431,10 @@ static int put_seg(float *arr, int *n, int cap, Vector2 a, Vector2 b);
 #define ORB_TRAVEL 0.1f
 #define GAP_A 0.2f // the gap spans this part of the middle segment, as fractions of its length
 #define GAP_B 0.8f
-// 0 -> 1 while the player runs along the last stretch of the road (and 1 once arrived): everything turns green
+// 0 -> 1 while the player runs along a calm stretch or the last stretch of the road (and 1 once arrived): everything turns green
 static float end_progress(void) {
     if (st == ST_WON) return 1.0f;
-    if ((st != ST_PLAY && st != ST_ZOOM) || !L[lv].end || kind != K_APPROACH) return 0.0f;
+    if ((st != ST_PLAY && st != ST_ZOOM) || !(L[lv].end || L[lv].calm) || kind != K_APPROACH) return 0.0f;
     return ease(Clamp(1.0f - Vector2Distance(pos, to) / fmaxf(S[lv][0].len, 1.0f), 0, 1));
 }
 static int has_gap(int j, int t) { return L[j].merge && (t == 2 || t == 5); }
@@ -495,13 +518,20 @@ static void build_level(int i) {
     Level *l = &L[i];
     if (i == 0) { l->P = (Vector2){0, 0}; l->F = (Vector2){0, -START_LEN}; }
     else { l->P = L[i - 1].N; l->F = (Vector2){l->P.x, l->P.y - L[i - 1].S}; }
-    l->end = 0;
+    l->end = 0; l->calm = 0;
     if (i == WIN_SCORE) { // the end of the road: no more forks, just a long dead end
         // long enough for about 5 seconds of calm running (2.6 s at full speed, plus the slow-down at the end): anticipation
         l->F = (Vector2){l->P.x, l->P.y - (380.0f + 2.6f * baseSpeed(i))};
         l->N = l->D1 = l->D2 = l->E1 = l->E2 = l->F;
         l->side = 1; l->dirD = -1; l->three = l->merge = 0; l->S = 0; l->gapPhase = l->orbF = l->orbVel = l->orbHue = 0;
         l->end = 1;
+        return;
+    }
+    if (calm_msg(i)) { // a safe, steady stretch of about 3 seconds: no fork, the road just continues
+        l->F = (Vector2){l->P.x, l->P.y - 3.2f * baseSpeed(i)};
+        l->N = l->D1 = l->D2 = l->E1 = l->E2 = l->F;
+        l->side = 1; l->dirD = -1; l->three = l->merge = 0; l->S = 150; l->gapPhase = l->orbF = l->orbVel = l->orbHue = 0;
+        l->calm = 1;
         return;
     }
     float T = frand(340, 420);
@@ -683,7 +713,7 @@ static void draw_path(void) {
             seg_geo(j, t, &a, &b);
             a = Vector2Lerp(a, b, S[j][t].burn); // burnt away from the root
             Color c = t == 0 ? PAL[j % PAL_N] : PAL[(j + 1) % PAL_N];
-            if (L[j].end) c = mix_color(c, FGREEN, end_progress()); // the last road gradually turns green
+            if (L[j].end || L[j].calm) c = mix_color(c, FGREEN, j == lv ? end_progress() : (j < lv ? 1.0f : 0.0f)); // calm roads gradually turn green
             int k = put_seg_j(uP, &nuP, MAXPS, j, t, a, b); // k pieces (more than one when a gap splits it)
             for (int q = 1; q <= k; q++) {
                 float *pc = uPc + (nuP - q) * 3;
@@ -755,6 +785,7 @@ static void compute_targets(void) {
     for (; j < gen && j <= lv + 7; j++) {
         if (j > lv) S[j][0].target = 1;
         if (L[j].end) break; // the road ends here
+        if (L[j].calm) continue; // the road just goes on
         int sel = eff_sel(j);
         if (L[j].merge) { // both branches lead on: the selected side is the one lit
             for (int t = sel < 0 ? 1 : 4; t <= (sel < 0 ? 3 : 6); t++) S[j][t].target = 1;
@@ -989,7 +1020,8 @@ static void reset_game(void) {
     to = L[0].F;
     kind = K_APPROACH;
     lv = 0; choice = 0; lastSide = 1; speed = baseSpeed(0);
-    introSel = 0; runT = 0; winT = 0; firstMerge = -1; mergesPassed = 0; mergeZoom = 1;
+    introSel = 0; runT = 0; winT = 0; firstMerge = -1;
+    forkChanges = 0; commitHesitated = commitNoPress = 0; lossMsg = NULL; mergesPassed = 0; mergeZoom = 1;
     deathBurn = 0; flash = 0; shake = 0;
     for (int i = 0; i < MAXP; i++) parts[i].life = 0;
     st = ST_INTRO;
@@ -1007,8 +1039,16 @@ static void win(void) {
     sfxp(sWin, 0, 1.0f);
 }
 
+static const char *pick_msg(const char *const *m, int n) { return m[GetRandomValue(0, n - 1)]; }
+
 static void crash(void) {
     st = ST_DEAD; deadT = 0; flash = 0.5f; shake = 1;
+    static const char *const hesitated[] = {"Hesitation burns the fuse.", "The fuse doesn't wait for an undecided turn.", "Every second of doubt shortens the road."};
+    static const char *const forkMiss[] = {"A trip is made of small choices, and one missed turn.", "Every fork asks a question. That one said stop."};
+    static const char *const gapMiss[] = {"You found the branch, but the passage wasn't open yet.", "Almost through, just needed a beat for the passage to clear."};
+    if (commitHesitated) lossMsg = pick_msg(hesitated, 3);
+    else if (commitNoPress) lossMsg = "You paused too long. The fire caught your heels.";
+    else lossMsg = L[lv].merge ? pick_msg(gapMiss, 2) : pick_msg(forkMiss, 2);
     sfxp(sCrash, 0, 1.0f);
     if (lv > best[hard]) best[hard] = lv; // the score is the number of forks passed
     for (int i = 0; i < MAXP; i++) {
@@ -1017,6 +1057,13 @@ static void crash(void) {
         parts[i] = (Particle){pos, {cosf(a) * v, sinf(a) * v}, life, life,
                               GetRandomValue(0, 2) ? PAL[(lv + 1) % PAL_N] : WHITE, 1};
     }
+}
+
+// the player commits to a branch: what did the last stretch of deciding look like?
+static void note_commit(void) {
+    commitHesitated = forkChanges >= HESITATE_CHANGES || (forkChanges >= 1 && tnow - forkLastChange < HESITATE_LATE);
+    commitNoPress = forkChanges == 0;
+    forkChanges = 0; // changes from now on count for the next fork
 }
 
 // the player reached the end of a fork (the node after its last segment): score and move on to the next fork
@@ -1038,6 +1085,7 @@ static int pass_fork(void) {
 static int merge_step(void) {
     Vector2 a;
     if (kind == K_APPROACH) {
+        note_commit();
         S[lv][0].burning = 1; // the approach behind us can no longer be selected
         int left = eff_sel(lv) < 0;
         for (int t = left ? 4 : 1; t <= (left ? 6 : 3); t++) S[lv][t].burning = S[lv][t].alt = 1; // the other branch burns away
@@ -1068,11 +1116,13 @@ static void advance(float dt) {
         }
         pos = to; rem -= d;
         if (L[lv].end) { win(); return; }
+        if (L[lv].calm) { S[lv][0].burning = 1; if (!pass_fork()) return; continue; } // nothing to decide here
         if (L[lv].merge) { if (!merge_step()) return; continue; }
         switch (kind) {
         case K_APPROACH: { // reached the fork: commit to the chosen side
             Level *m = &L[lv];
             int c = eff_sel(lv);
+            note_commit();
             S[lv][0].burning = 1; // the approach behind us can no longer be selected
             if (c == m->side) {
                 to = m->N; kind = K_TRUE;
@@ -1255,7 +1305,7 @@ static void apply_selection(const Input *in, int W) {
     if (st == ST_PLAY) {
         // the next fork decides the layout: 3-way forks step left/middle/right, 2-way forks jump to a side
         int upc = next_fork();
-        if (upc < gen && L[upc].end) return; // no more forks
+        if (upc < gen && (L[upc].end || L[upc].calm)) return; // nothing to decide
         int three = upc < gen && L[upc].three, nc = choice, changed = 0;
         if (in->keyPick) { nc = three ? (int)Clamp((float)(choice + in->keyPick), -1, 1) : in->keyPick; changed = 1; }
         else if (upc < gen) {
@@ -1263,7 +1313,7 @@ static void apply_selection(const Input *in, int W) {
             else if (in->moved) { nc = screen_dir(in->mpos.x, W, three); changed = 1; }
         }
         if (changed) {
-            if (nc != choice) sfxp(sPick, nc, 1.0f + 0.08f * nc);
+            if (nc != choice) { sfxp(sPick, nc, 1.0f + 0.08f * nc); forkChanges++; forkLastChange = tnow; }
             choice = nc;
             if (nc) lastSide = nc;
         }
@@ -1302,7 +1352,7 @@ static void update_audio(int W) {
         int upc = next_fork();
         if (upc < gen) {
             aud_pan = (float)eff_sel(upc);
-            aud_lean = kind == K_APPROACH ? Clamp(1 - Vector2Distance(pos, L[lv].F) / 450.0f, 0, 1) : 0.0f;
+            aud_lean = kind == K_APPROACH && !L[lv].calm && !L[lv].end ? Clamp(1 - Vector2Distance(pos, L[lv].F) / 450.0f, 0, 1) : 0.0f;
         }
     }
     burn_audio(W);
@@ -1468,6 +1518,20 @@ static void draw_fog(int W, int H) {
     EndShaderMode();
 }
 
+// a message that is split into two lines (at the space nearest to the middle) when it is wider than maxW
+static void NeonWrapped(const char *t, Vector2 c, float fs, Color col, float a, float maxW) {
+    float px = fs * uiS;
+    if (MeasureTextEx(faceUI.f, t, px, px * 0.06f).x <= maxW) { NeonText(t, c, fs, col, a); return; }
+    int n = (int)strlen(t), best = -1;
+    for (int i = 0; i < n; i++) if (t[i] == ' ' && (best < 0 || abs(i - n / 2) < abs(best - n / 2))) best = i;
+    if (best < 0) { NeonText(t, c, fs, col, a); return; }
+    char l1[160], l2[160];
+    snprintf(l1, sizeof l1, "%.*s", best, t);
+    snprintf(l2, sizeof l2, "%s", t + best + 1);
+    NeonText(l1, (Vector2){c.x, c.y - px * 0.6f}, fs, col, a);
+    NeonText(l2, (Vector2){c.x, c.y + px * 0.6f}, fs, col, a);
+}
+
 static void draw_hud(int W, int H) {
     const Diff *dif = &DIFF[hard];
     if (st == ST_INTRO) {
@@ -1481,8 +1545,13 @@ static void draw_hud(int W, int H) {
             const Run r[] = {{"BEST ", &faceUI}, {TextFormat("%d", best[hard]), &faceNum}};
             NeonRun((Vector2){W / 2.0f, 142 * uiS}, 22, WHITE, 0.9f, r, 2);
         }
+        if (st == ST_PLAY && L[lv].calm && kind == K_APPROACH) { // a calm stretch: its message fades in, then out
+            float p = 1.0f - Vector2Distance(pos, to) / fmaxf(S[lv][0].len, 1.0f);
+            float a = ease(Clamp((p - 0.06f) / 0.2f, 0, 1)) * (1.0f - ease(Clamp((p - 0.7f) / 0.2f, 0, 1)));
+            if (a > 0.01f) NeonWrapped(calm_msg(lv), (Vector2){W / 2.0f, H * 0.3f}, 32, mix_color(WHITE, FGREEN, 0.35f), a, W * 0.9f);
+        }
         int upc = next_fork();
-        if (st != ST_DEAD && st != ST_WON && !(upc < gen && L[upc].end))
+        if (st != ST_DEAD && st != ST_WON && !(upc < gen && (L[upc].end || L[upc].calm)))
             draw_arrows(W, H, upc < gen ? eff_sel(upc) : choice, upc < gen && L[upc].three);
     }
     if (st == ST_DEAD && deadT > 0.35f) {
@@ -1491,8 +1560,9 @@ static void draw_hud(int W, int H) {
         NeonTextF(&faceTitle, "WRONG TURN", (Vector2){W / 2.0f, H * 0.4f}, 84, PAL[1], a);
         const Run r[] = {{"SCORE ", &faceUI}, {TextFormat("%d", lv), &faceNum}, {"   BEST ", &faceUI}, {TextFormat("%d", best[hard]), &faceNum}};
         NeonRun((Vector2){W / 2.0f, H * 0.5f}, 36, WHITE, a, r, 4);
+        if (lossMsg) NeonWrapped(lossMsg, (Vector2){W / 2.0f, H * 0.58f}, 26, WHITE, a * 0.95f, W * 0.9f);
         if (deadT > 0.7f && fmodf(tnow, 1.2f) < 0.8f)
-            NeonText(kbHint ? "SPACE OR CLICK TO CHOOSE AGAIN" : "TAP TO CHOOSE AGAIN", (Vector2){W / 2.0f, H * 0.6f}, 30, PAL[0], 0.9f);
+            NeonText(kbHint ? "SPACE OR CLICK TO CHOOSE AGAIN" : "TAP TO CHOOSE AGAIN", (Vector2){W / 2.0f, H * 0.7f}, 30, PAL[0], 0.9f);
     }
     if (st == ST_WON && winT > 1.0f) { // the ending
         float a = Clamp((winT - 1.0f) * 2, 0, 1), y = H * 0.44f, gap = 46 * uiS;
