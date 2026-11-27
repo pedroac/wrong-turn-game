@@ -28,6 +28,7 @@
 #ifndef WIN_SCORE
 #define WIN_SCORE 999 // reaching this score ends the game: the road ends in a dead end and you win
 #endif
+#define MERGE_FINALE 10 // the last forks before the end of the road are all merge forks
 
 static const Color PAL[PAL_N] = {
     {0, 255, 255, 255}, {255, 40, 200, 255}, {120, 255, 40, 255},
@@ -113,12 +114,12 @@ typedef struct {
     float extra0, extraStep, extraCap, extraRand;      // extra length of a dead end's tip
     float zStart, zMax, zSecs;                         // gameplay zoom: starts zoomed out, eases in over zSecs
     float fogMax, fogStep, fogMin;                     // fog radius (px at 900 px height): clamp(fogMax - fogStep * fork)
-    int merge0; float mergeP0, mergeStep, mergeMax;    // merge forks (with the orb): from fork merge0, chance mergeP0 + mergeStep * (fork - merge0), capped at mergeMax
+    int merge0; float mergeP0, mergeStep, mergeMax;    // merge forks (with the orb): from fork merge0, chance mergeP0 + mergeStep per full 100 forks since merge0, capped at mergeMax
     float startPitch;                                  // pitch of the start whoosh
 } Diff;
 static const Diff DIFF[2] = {
-    {"EASY", 0, 300, 10, 520, 240, 3, 8, 0.2f, 0.03f, 0.5f, 0.4f, 0.6f, 40, 4, 60, 30, 0.45f, 0.8f, 90, 1500, 20, 900, 50, 0.06f, 0.012f, 0.4f, 0.9f},
-    {"HARD", 1, 380, 20, 780, 170, 8, 4, 0.3f, 0.04f, 0.7f, 0.6f, 0.85f, 60, 10, 160, 50, 0.5f, 0.95f, 60, 1100, 40, 520, 50, 0.05f, 0.01f, 0.35f, 1.2f},
+    {"EASY", 0, 300, 10, 520, 240, 3, 8, 0.2f, 0.03f, 0.5f, 0.4f, 0.6f, 40, 4, 60, 30, 0.45f, 0.8f, 90, 1500, 20, 900, 100, 0.05f, 0.04f, 0.4f, 0.9f},
+    {"HARD", 1, 380, 20, 780, 170, 8, 4, 0.3f, 0.04f, 0.7f, 0.6f, 0.85f, 60, 10, 160, 50, 0.5f, 0.95f, 60, 1100, 40, 520, 100, 0.04f, 0.035f, 0.35f, 1.2f},
 };
 static float baseSpeed(int l) { const Diff *d = &DIFF[hard]; return fminf(d->spd0 + d->spdStep * l, d->spdMax); }
 
@@ -496,7 +497,8 @@ static void build_level(int i) {
     else { l->P = L[i - 1].N; l->F = (Vector2){l->P.x, l->P.y - L[i - 1].S}; }
     l->end = 0;
     if (i == WIN_SCORE) { // the end of the road: no more forks, just a long dead end
-        l->F = (Vector2){l->P.x, l->P.y - 700};
+        // long enough for about 5 seconds of calm running (2.6 s at full speed, plus the slow-down at the end): anticipation
+        l->F = (Vector2){l->P.x, l->P.y - (380.0f + 2.6f * baseSpeed(i))};
         l->N = l->D1 = l->D2 = l->E1 = l->E2 = l->F;
         l->side = 1; l->dirD = -1; l->three = l->merge = 0; l->S = 0; l->gapPhase = l->orbF = l->orbVel = l->orbHue = 0;
         l->end = 1;
@@ -516,7 +518,8 @@ static void build_level(int i) {
         return;
     }
     // some forks split and merge again: both branches lead on, but the middle of each blinks open/closed
-    if (i >= df->merge0 && frand(0, 1) < fminf(df->mergeP0 + df->mergeStep * (i - df->merge0), df->mergeMax)) {
+    // (and the last stretch before the end of the road is a run of merge forks)
+    if ((i >= WIN_SCORE - MERGE_FINALE) || (i >= df->merge0 && frand(0, 1) < fminf(df->mergeP0 + df->mergeStep * ((i - df->merge0) / 100), df->mergeMax))) {
         l->merge = 1; l->side = 1; l->dirD = -1;
         l->gapPhase = frand(0, 1);
         float ang = frand(35, 45) * DEG2RAD, diag = frand(190, 230), mid = frand(300, 360);
@@ -1317,7 +1320,9 @@ static void update_camera(float dt, int W, int H, float zs) {
         float back = fmaxf(Clamp((mergesPassed - 2) / 4.0f, 0, 1), Clamp((lv - firstMerge - 20) / 15.0f, 0, 1));
         mzTarget = Lerp(0.72f, 1.0f, back);
     }
-    mergeZoom += (mzTarget - mergeZoom) * fminf(1, 1.2f * dt);
+    // the finale (a run of merge forks) zooms out again so the player can prepare; the view eases back in on the final road
+    if (lv >= WIN_SCORE - MERGE_FINALE - 3 && lv < WIN_SCORE) mzTarget = fminf(mzTarget, 0.72f);
+    mergeZoom += (mzTarget - mergeZoom) * fminf(1, (lv >= WIN_SCORE ? 0.4f : 1.2f) * dt);
     float Zg = Lerp(dif->zStart, dif->zMax, ease(Clamp(runT / dif->zSecs, 0, 1))) * zs * mergeZoom;
     cam.offset = (Vector2){W / 2.0f, H / 2.0f};
     if (st == ST_INTRO) {
