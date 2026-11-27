@@ -118,6 +118,7 @@ typedef struct { Sound v[3]; } Sfx; // pre-panned variants: [0] left, [1] centre
 static Sfx sStart, sPick, sWrong, sCrash;
 static AudioStream bed;
 static int audioOK, muted, bedOn;
+static int inBackground; // window not focused / hidden: the frame rate drops, so the sound is muted instead of stuttering
 // live controls for the streamed bed, set by the game every frame
 static float aud_drone, aud_speed = 380, aud_pan, aud_lean, aud_burn, aud_burnPan;
 
@@ -278,7 +279,7 @@ static void audio_init(void) {
 
 // dir: -1 left, 0 centre, +1 right
 static void sfxp(Sfx s, int dir, float pitch) {
-    if (!audioOK || muted || !s.v[1].stream.buffer) return; // not built yet
+    if (!audioOK || muted || inBackground || !s.v[1].stream.buffer) return; // not built yet
     Sound v = s.v[dir < 0 ? 0 : (dir > 0 ? 2 : 1)];
     SetSoundPitch(v, pitch);
     PlaySound(v);
@@ -332,7 +333,7 @@ static void bed_fill(short *out, int frames) {
 
 static void bed_update(void) {
     if (!audioOK) return;
-    if (muted) { if (bedOn) { StopAudioStream(bed); bedOn = 0; } return; }
+    if (muted || inBackground) { if (bedOn) { StopAudioStream(bed); bedOn = 0; } return; }
     if (!bedOn) { PlayAudioStream(bed); bedOn = 1; }
     static short tmp[CHUNK * 2];
     while (IsAudioStreamProcessed(bed)) { bed_fill(tmp, CHUNK); UpdateAudioStream(bed, tmp, CHUNK); }
@@ -900,6 +901,15 @@ static Vector2 tStart, tLast;
 static float tStartT, lastTouchT = -10;
 
 // ---------------------------------------------------------------- platform glue (the only place with #ifdefs)
+// is the game window in the background (another workspace/window, minimized, hidden tab)?
+static int platform_in_background(void) {
+#ifdef PLATFORM_WEB
+    return EM_ASM_INT({ return document.hidden ? 1 : 0; });
+#else
+    return !IsWindowFocused() || IsWindowHidden() || IsWindowMinimized();
+#endif
+}
+
 static void platform_pre_frame(void) {
 #ifdef PLATFORM_WEB
     // follow the browser window size (responsive canvas), resizing only when the window changed
@@ -1201,6 +1211,11 @@ static void draw_hud(int W, int H) {
 
 static void frame(void) {
     platform_pre_frame();
+    int bg = platform_in_background();
+    if (bg != inBackground) { // silence everything while in the background, restore when back
+        inBackground = bg;
+        if (audioOK) SetMasterVolume(bg ? 0.0f : 1.0f);
+    }
     audio_warm();
     float dt = fminf(GetFrameTime(), 0.05f);
     int W = GetScreenWidth(), H = GetScreenHeight();
