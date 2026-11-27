@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Wrong Turn</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  canvas.emscripten { display: block; border: 0; background: #000; width: 100vw; height: 100vh; height: 100dvh; touch-action: none;
+                      -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; }
+  #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+             background: #000; color: #0ff; font: 700 36px/1.2 sans-serif; letter-spacing: 6px; z-index: 2; text-shadow: 0 0 14px #0ff; }
+  #status { margin-top: 12px; color: #8aa; font: 14px/1.2 sans-serif; letter-spacing: 0; text-shadow: none; }
+</style>
+</head>
+<body>
+<div id="loading">LOADING<div id="status"></div></div>
+<canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+<script>
+  var Module = {
+    canvas: document.getElementById('canvas'),
+    setStatus: function (t) { document.getElementById('status').textContent = t || ''; },
+    onRuntimeInitialized: function () { var l = document.getElementById('loading'); if (l) l.style.display = 'none'; }
+  };
+  var cv = document.getElementById('canvas');
+  cv.addEventListener('mousedown', function () { this.focus(); });
+  window.addEventListener('load', function () { window.focus(); cv.focus(); });
+  /* no page scrolling / pull-to-refresh / pinch-zoom while playing */
+  ['touchstart', 'touchmove'].forEach(function (n) {
+    document.addEventListener(n, function (e) { e.preventDefault(); }, { passive: false });
+  });
+  window.addEventListener('keydown', function (e) {
+    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].indexOf(e.code) >= 0) e.preventDefault();
+  }, { passive: false });
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

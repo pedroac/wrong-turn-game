@@ -1,0 +1,10 @@
+# Build output
+/wrong-turn
+/web/
+/wrong-turn-web.zip
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
